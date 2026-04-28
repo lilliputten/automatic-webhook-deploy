@@ -1,7 +1,8 @@
 <?php
+// vim:fdm=marker
 /**
  * @module core
- * @version 2019.01.25, 21:45
+ * @changed 2026.04.28, 04:22
  *
  * Routines for work with bitbucket/github server, repositories and projects.
  *
@@ -23,24 +24,26 @@
 
 define('DEFAULT_FOLDER_MODE', 0755);
 
-if ( !defined('NL') ) {
-    define('NL',"\n");
+if (!defined('NL')) {
+    define('NL', "\n");
 }
 
-$PAYLOAD   = array ();
-$BRANCHES  = array ();
-$REPO      = ''; // Repository name (owner/name)
+$PAYLOAD = array();
+$BRANCHES = array();
+$REPO = ''; // Repository name (owner/name)
 $REPO_FOLDER_NAME = ''; // Repository folder path (under `$REPOSITORIES_PATH` -- see config)
 $REPO_TYPE = ''; // Repository type: bitbucket|github
 $REPO_URL_PREFIX = ''; // Repo url prefix from `$REPO_URL_PREFIXES` for `$REPO_TYPE`
 $REPO_URL_PREFIXES = array(
+    // 'bitbucket-lilliputten' => 'git@bitbucket.org-lilliputten',
     'bitbucket' => 'git@bitbucket.org',
     'github' => 'git@github.com',
+    'gitlab' => 'git@gitlab.com',
 );
 
 /*}}}*/
 
-function initConfig ()/*{{{ Initializing repo configs */
+function initConfig()/*{{{ Initializing repo configs */
 {
     global $CONFIG, $PROJECTS;
 
@@ -48,18 +51,18 @@ function initConfig ()/*{{{ Initializing repo configs */
 
     // Bitbucket uses lower case repo names!
     $hadUppercaseKeys = false;
-    foreach ( $PROJECTS as $repoName => $config ) {
+    foreach ($PROJECTS as $repoName => $config) {
         $tmpProjects[strtolower($repoName)] = $config;
         $hadUppercaseKeys = true;
     }
 
     // Rewrite projects list if has changes
-    if ( $hadUppercaseKeys ) {
+    if ($hadUppercaseKeys) {
         $PROJECTS = $tmpProjects;
     }
 
     // Set default folder mode if absent
-    if ( empty($CONFIG['folderMode']) ) {
+    if (empty($CONFIG['folderMode'])) {
         $CONFIG['folderMode'] = DEFAULT_FOLDER_MODE;
     }
 
@@ -67,12 +70,12 @@ function initConfig ()/*{{{ Initializing repo configs */
     // Do not use logging here!
 
 }/*}}}*/
-function initLog ()/*{{{ Initializing log variables */
+function initLog()/*{{{ Initializing log variables */
 {
     _LOG_INIT();
 
 }/*}}}*/
-function initPayload ()/*{{{ Get posted data */
+function initPayload()/*{{{ Get posted data */
 {
     global $CONFIG, $PAYLOAD, $REPO_TYPE, $REPO_URL_PREFIXES, $REPO_URL_PREFIX;
 
@@ -92,19 +95,19 @@ function initPayload ()/*{{{ Get posted data */
         _LOG('*** Cannot detect event, hook id, remote agent or address!');
     }
 
-    if ( isset($_POST['payload']) ) { // old method
+    if (isset($_POST['payload'])) { // old method
         $PAYLOAD = $_POST['payload'];
     } else { // new method
         $PAYLOAD = json_decode(file_get_contents('php://input'));
     }
 
-    if ( empty($PAYLOAD) ) {
+    if (empty($PAYLOAD)) {
         _ERROR("No payload data for checkout!");
         exit;
     }
 
-    if ( $CONFIG['logPayload'] ) {
-        _LOG_VAR('PAYLOAD',$PAYLOAD);
+    if ($CONFIG['logPayload']) {
+        _LOG_VAR('PAYLOAD', $PAYLOAD);
     }
 
     // Check for correct payload data received...
@@ -113,6 +116,11 @@ function initPayload ()/*{{{ Get posted data */
         if (isset($PAYLOAD->push->changes)) {
             _LOG("Detected bitbucket mode (changes list)");
             $REPO_TYPE = 'bitbucket';
+        }
+        // Gitlab mode...
+        else if (isset($PAYLOAD->project->web_url) && str_starts_with($PAYLOAD->project->web_url, 'https://gitlab.com')) {
+            _LOG("Detected gitlab mode");
+            $REPO_TYPE = 'gitlab';
         }
         // Github mode (one branch)...
         else if (isset($PAYLOAD->ref)) {
@@ -138,14 +146,23 @@ function initPayload ()/*{{{ Get posted data */
     _LOG('Repository url prefix: ' . $REPO_URL_PREFIX);
 
 }/*}}}*/
-function fetchParams ()/*{{{ Get parameters from bitbucket payload now only (REPO) */
+function fetchParams()/*{{{ Get parameters from bitbucket payload now only (REPO) */
 {
     global $CONFIG, $REPO, $REPO_FOLDER_NAME, $REPO_TYPE, $PAYLOAD, $PROJECTS, $BRANCHES;
 
     // Get repository name:
     $REPO = strtolower($PAYLOAD->repository->full_name);
+    if (empty($REPO) && isset($PAYLOAD->repository->url)) {
+        $REPO = $PAYLOAD->repository->url;
+
+        // Extract repository path from GitLab URL format (git@gitlab.com:path/to/repo.git)
+        if (preg_match('/git@gitlab\.com:(.*)\.git/', $REPO, $matches)) {
+            $REPO = $matches[1];
+            _LOG("Extracted repository path from GitLab URL: $REPO");
+        }
+    }
     _LOG_VAR('Repository', $REPO);
-    if ( empty($PROJECTS[$REPO]) ) {
+    if (empty($PROJECTS[$REPO])) {
         _ERROR("Not found repository config for '$REPO'!");
         exit;
     }
@@ -155,7 +172,7 @@ function fetchParams ()/*{{{ Get parameters from bitbucket payload now only (REP
     // Bitbucket mode (changes list)...
     if ($REPO_TYPE === 'bitbucket') {
         _LOG("Bitbucket mode (changes list)");
-        foreach ( $PAYLOAD->push->changes as $change ) {
+        foreach ($PAYLOAD->push->changes as $change) {
             // TODO: Fetch branch name for github from `$PAYLOAD->ref`
             if (is_object($change->new) && $change->new->type == "branch") {
                 $branchName = $change->new->name;
@@ -163,9 +180,20 @@ function fetchParams ()/*{{{ Get parameters from bitbucket payload now only (REP
                 if (isset($PROJECTS[$REPO][$branchName])) {
                     // Create branch name for checkout
                     array_push($BRANCHES, $branchName);
-                    _LOG("Found changes in branch: ".$branchName);
+                    _LOG("Found changes in branch: " . $branchName);
                 }
             }
+        }
+    }
+    // Github mode (one branch)...
+    else if ($REPO_TYPE === 'gitlab') {
+        _LOG("Github mode (one branch)");
+        $branchName = preg_replace('/refs\/heads\//', '', $PAYLOAD->ref);
+        _LOG("Found gitlab branch: " . $branchName);
+        if (isset($PROJECTS[$REPO][$branchName])) {
+            // Create branch name for checkout
+            array_push($BRANCHES, $branchName);
+            _LOG("Found changes in branch: " . $branchName);
         }
     }
     // Github mode (one branch)...
@@ -176,11 +204,11 @@ function fetchParams ()/*{{{ Get parameters from bitbucket payload now only (REP
         if (isset($PROJECTS[$REPO][$branchName])) {
             // Create branch name for checkout
             array_push($BRANCHES, $branchName);
-            _LOG("Found changes in branch: ".$branchName);
+            _LOG("Found changes in branch: " . $branchName);
         }
     }
 
-    if ( empty($BRANCHES) ) {
+    if (empty($BRANCHES)) {
         _ERROR("Nothing to update (no branches found)! Please check correct branch names in your config PROJECTS list.");
         // TODO: exit?
     }
@@ -196,36 +224,38 @@ function fetchParams ()/*{{{ Get parameters from bitbucket payload now only (REP
 
 
 }/*}}}*/
-function checkPaths ()/*{{{ Check repository and project paths; create them if neccessary */
+function checkPaths()/*{{{ Check repository and project paths; create them if neccessary */
 {
     global $REPO, $CONFIG, $PROJECTS, $BRANCHES;
 
     // Check for repositories folder path; create if absent
     $repoRoot = $CONFIG['repositoriesPath'];
-    if ( !is_dir($repoRoot) ) {
+    if (!is_dir($repoRoot)) {
         $mode = $CONFIG['folderMode'];
-        if ( mkdir($repoRoot,$mode,true) ) {
-            chmod($repoRoot,$mode); // NOTE: Ensuring folder mode!
-            _LOG("Creating root repositories folder '".$repoRoot." (".decoct($mode).") for '$REPO'");
-        }
-        else {
-            _ERROR("Error creating root repositories folder '".$repoRoot." for '$REPO'! Exiting.");
+        if (mkdir($repoRoot, $mode, true)) {
+            chmod($repoRoot, $mode); // NOTE: Ensuring folder mode!
+            _LOG("Creating root repositories folder '" . $repoRoot . " (" . decoct($mode) . ") for '$REPO'");
+        } else {
+            _ERROR("Error creating root repositories folder '" . $repoRoot . " for '$REPO'! Exiting.");
             exit;
         }
     }
 
     // Create folder if absent for each pushed branch
-    foreach ( $BRANCHES as $branchName ) {
+    foreach ($BRANCHES as $branchName) {
         $deployPath = $PROJECTS[$REPO][$branchName]['deployPath'];
-        if ( !is_dir($deployPath) ) {
+        if (empty($deployPath)) {
+            _ERROR("Not specified deployPath for '$REPO' branch '$branchName'! Exiting.");
+            exit;
+        }
+        if (!is_dir($deployPath)) {
             $mode = $CONFIG['folderMode'];
-            if ( mkdir($deployPath,$mode,true) ) {
-                chmod($deployPath,$mode); // NOTE: Ensuring folder mode!
-                _LOG("Creating project folder '".$deployPath.
-                    " (".decoct($mode).") for '$REPO' branch '$branchName'");
-            }
-            else {
-                _ERROR("Error creating project folder '".$deployPath.
+            if (mkdir($deployPath, $mode, true)) {
+                chmod($deployPath, $mode); // NOTE: Ensuring folder mode!
+                _LOG("Creating project folder '" . $deployPath .
+                    " (" . decoct($mode) . ") for '$REPO' branch '$branchName'");
+            } else {
+                _ERROR("Error creating project folder '" . $deployPath .
                     "' for '$REPO' branch '$branchName'! Exiting.");
                 exit;
             }
@@ -233,38 +263,42 @@ function checkPaths ()/*{{{ Check repository and project paths; create them if n
     }
 
 }/*}}}*/
-function placeVerboseInfo ()/*{{{ Place verbose log information -- if specified in config */
+function placeVerboseInfo()/*{{{ Place verbose log information -- if specified in config */
 {
     global $CONFIG; // , $REPO, $BRANCHES;
 
-    if ( $CONFIG['verbose'] ) {
+    if ($CONFIG['verbose']) {
         // _LOG_VAR('REPO',$REPO);
         // _LOG_VAR('BRANCHES',$BRANCHES);
     }
 
 }/*}}}*/
-function fetchRepository ()/*{{{ Fetch or clone repository */
+function fetchRepository()/*{{{ Fetch or clone repository */
 {
-    global $REPO, $REPO_FOLDER_NAME, $REPO_URL_PREFIX, $CONFIG;
+    global $REPO, $REPO_FOLDER_NAME, $REPO_URL_PREFIX, $CONFIG, $PROJECT_OPTIONS, $PROJECTS, $BRANCHES, $PAYLOAD;
 
     // Compose current repository path
     $repoRoot = $CONFIG['repositoriesPath'];
-    $repoPath = $repoRoot.DIRECTORY_SEPARATOR.$REPO_FOLDER_NAME;
+    $repoPath = $repoRoot . DIRECTORY_SEPARATOR . $REPO_FOLDER_NAME;
 
     // If repository or repository folder are absent then clone full repository
-    if ( !is_dir($repoPath) || !is_file($repoPath.DIRECTORY_SEPARATOR.'HEAD') ) {
+    if (!is_dir($repoPath) || !is_file($repoPath . DIRECTORY_SEPARATOR . 'HEAD')) {
         _LOG("Repository folder absent for '$REPO', cloning...");
 
-        $repoUrl = $REPO_URL_PREFIX.':'.$REPO.'.git';
+        $repoUrlPrefix = $REPO_URL_PREFIX;
+        $repoUrlPostfix = $PROJECT_OPTIONS[$REPO]['repoUrlPostfix'];
+        if (!empty($repoUrlPostfix)) {
+            $repoUrlPrefix .= $repoUrlPostfix;
+        }
+        $repoUrl = $repoUrlPrefix . ':' . $REPO . '.git';
 
-        $cmd = 'cd "'.$repoRoot.'" && '.$CONFIG['gitCommand']
-            .' clone --mirror '.$repoUrl.' "'.$REPO_FOLDER_NAME.'" 2>&1';
-        _LOG_VAR('cmd',$cmd);
-        // system($cmd, $status);
+        $cmd = 'cd "' . $repoRoot . '" && ' . $CONFIG['gitCommand']
+            . ' clone --mirror ' . $repoUrl . ' "' . $REPO_FOLDER_NAME . '" 2>&1';
+        _LOG_VAR('cmd', $cmd);
         exec($cmd, $output, $status);
 
-        if ( $status !== 0 ) {
-            _ERROR('Cannot clone repository '.$repoUrl.': '.NL.implode(NL,$output));
+        if ($status !== 0) {
+            _ERROR('Cannot clone repository ' . $repoUrl . ': ' . NL . implode(NL, $output));
             exit;
         }
     }
@@ -272,59 +306,59 @@ function fetchRepository ()/*{{{ Fetch or clone repository */
     else {
         _LOG("Repository folder exists for '$REPO', fetching...");
 
-        $cmd = 'cd "'.$repoPath.'" && '.$CONFIG['gitCommand'].' fetch 2>&1';
-        _LOG_VAR('cmd',$cmd);
+        $cmd = 'cd "' . $repoPath . '" && ' . $CONFIG['gitCommand'] . ' fetch 2>&1';
+        _LOG_VAR('cmd', $cmd);
         // system($cmd, $status);
         exec($cmd, $output, $status);
 
-        if ( $status !== 0 ) {
-            _ERROR("Cannot fetch repository '$REPO' in '$repoPath': ".NL.implode(NL,$output));
+        if ($status !== 0) {
+            _ERROR("Cannot fetch repository '$REPO' in '$repoPath': " . NL . implode(NL, $output));
             exit;
         }
     }
 
 }/*}}}*/
-function checkoutProject ()/*{{{ Checkout project into target folder */
+function checkoutProject()/*{{{ Checkout project into target folder */
 {
     global $REPO, $REPO_FOLDER_NAME, $CONFIG, $PROJECTS, $BRANCHES;
 
     // Compose current repository path
-    $repoPath = $CONFIG['repositoriesPath'].DIRECTORY_SEPARATOR.$REPO_FOLDER_NAME;
+    $repoPath = $CONFIG['repositoriesPath'] . DIRECTORY_SEPARATOR . $REPO_FOLDER_NAME;
 
     // Checkout project files
-    foreach ( $BRANCHES as $branchName ) {
+    foreach ($BRANCHES as $branchName) {
 
         $deployPath = $PROJECTS[$REPO][$branchName]['deployPath'];
 
-        $cmd = 'cd "'.$repoPath.'" && GIT_WORK_TREE="'.$deployPath.'" '.$CONFIG['gitCommand'].' checkout -f '.$branchName.' 2>&1';
-        _LOG_VAR('cmd',$cmd);
+        $cmd = 'cd "' . $repoPath . '" && GIT_WORK_TREE="' . $deployPath . '" ' . $CONFIG['gitCommand'] . ' checkout -f ' . $branchName . ' 2>&1';
+        _LOG_VAR('cmd', $cmd);
         // system($cmd, $status);
         exec($cmd, $output, $status);
 
-        if ( $status !== 0 ) {
-            _ERROR("Cannot checkout branch '$branchName' in repo '$REPO': ".NL.implode(NL,$output));
+        if ($status !== 0) {
+            _ERROR("Cannot checkout branch '$branchName' in repo '$REPO': " . NL . implode(NL, $output));
             exit;
         }
 
         $postHookCmd = $PROJECTS[$REPO][$branchName]['postHookCmd'];
-        if ( !empty($postHookCmd) ) {
-            $cmd = 'cd "'.$deployPath.'" && '.$postHookCmd.' 2>&1';
-            _LOG_VAR('cmd',$cmd);
+        if (!empty($postHookCmd)) {
+            $cmd = 'cd "' . $deployPath . '" && ' . $postHookCmd . ' 2>&1';
+            _LOG_VAR('cmd', $cmd);
             // system($cmd, $status);
             exec($cmd, $output, $status);
 
-            if ( $status !== 0 ) {
-                _ERROR("Error in post hook command for branch '$branchName' in repo '$REPO': ".NL.implode(NL,$output));
+            if ($status !== 0) {
+                _ERROR("Error in post hook command for branch '$branchName' in repo '$REPO': " . NL . implode(NL, $output));
                 exit;
             }
         }
 
         // Log the deployment
         // TODO: Catch output & errors (` 2>&1`)???
-        $cmd = 'cd "'.$repoPath.'" && '.$CONFIG['gitCommand'].' rev-parse --short '.$branchName;
-        _LOG_VAR('cmd',$cmd);
+        $cmd = 'cd "' . $repoPath . '" && ' . $CONFIG['gitCommand'] . ' rev-parse --short ' . $branchName;
+        _LOG_VAR('cmd', $cmd);
         $hash = rtrim(shell_exec($cmd));
 
-        _LOG("Branch '$branchName' was deployed in '".$deployPath."', commit #$hash");
+        _LOG("Branch '$branchName' was deployed in '" . $deployPath . "', commit #$hash");
     }
 }/*}}}*/
